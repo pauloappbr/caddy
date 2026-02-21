@@ -46,6 +46,40 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite"
 )
 
+var (
+	inFlightRequests   = make(map[string]uint)
+	inFlightRequestsMu sync.RWMutex
+)
+
+func incInFlightRequest(address string) {
+	inFlightRequestsMu.Lock()
+	inFlightRequests[address]++
+	inFlightRequestsMu.Unlock()
+}
+
+func decInFlightRequest(address string) {
+	inFlightRequestsMu.Lock()
+	defer inFlightRequestsMu.Unlock()
+
+	if inFlightRequests[address] > 0 {
+		inFlightRequests[address]--
+	}
+	if inFlightRequests[address] == 0 {
+		delete(inFlightRequests, address)
+	}
+}
+
+func getInFlightRequests() map[string]uint {
+	inFlightRequestsMu.RLock()
+	defer inFlightRequestsMu.RUnlock()
+
+	copyMap := make(map[string]uint, len(inFlightRequests))
+	for k, v := range inFlightRequests {
+		copyMap[k] = v
+	}
+	return copyMap
+}
+
 func init() {
 	caddy.RegisterModule(Handler{})
 }
@@ -394,9 +428,6 @@ func (h *Handler) Cleanup() error {
 
 	// remove hosts from our config from the pool
 	for _, upstream := range h.Upstreams {
-		if upstream.NumRequests() > 0 {
-			upstream.fillInfilghtHost(upstream.NumRequests())
-		}
 		_, _ = hosts.Delete(upstream.String())
 	}
 
@@ -461,16 +492,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		var done bool
-		done, dialInfo, proxyErr := h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next)
+		done, _, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next)
 		if done {
-			key := dialInfo.Address
-			val := inflightHosts.Load(key)
-			if val != nil {
-				host, _ := val.(*Host)
-				if host.NumRequests() <= 0 {
-					_, _ = inflightHosts.Delete(key)
-				}
-			}
 			break
 		}
 		if h.VerboseLogs {
@@ -839,14 +862,11 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 // Go standard library which was used as the foundation.)
 func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
 	_ = di.Upstream.Host.countRequest(1)
+	incInFlightRequest(di.Address)
 	//nolint:errcheck
 	defer func() {
 		di.Upstream.Host.countRequest(-1)
-		inflightHost := inflightHosts.Load(di.Address)
-		if inflightHost != nil {
-			host, _ := inflightHost.(*Host)
-			host.countRequest(-1)
-		}
+		decInFlightRequest(di.Address)
 	}()
 	// point the request to this upstream
 	h.directRequest(req, di)

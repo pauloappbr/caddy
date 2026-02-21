@@ -102,33 +102,31 @@ func (adminUpstreams) handleUpstreams(w http.ResponseWriter, r *http.Request) er
 		})
 		return true
 	})
-	// Iterate over the inflight hosts
-	inflightHosts.Range(func(key, val any) bool {
-		address, ok := key.(string)
-		if !ok {
-			rangeErr = caddy.APIError{
-				HTTPStatus: http.StatusInternalServerError,
-				Err:        fmt.Errorf("could not type assert upstream address"),
+
+	// Iterate over our new in-flight tracker map
+	currentInFlight := getInFlightRequests()
+	for address, count := range currentInFlight {
+		// We only add entries that are actively in-flight but not present
+		// in the static hosts pool (e.g. dynamic upstreams during cleanup)
+
+		// Check if this address is already in the results list (from the static hosts pool)
+		alreadyInResults := false
+		for _, res := range results {
+			if res.Address == address {
+				alreadyInResults = true
+				break
 			}
-			return false
 		}
 
-		upstream, ok := val.(*Host)
-		if !ok {
-			rangeErr = caddy.APIError{
-				HTTPStatus: http.StatusInternalServerError,
-				Err:        fmt.Errorf("could not type assert upstream struct"),
-			}
-			return false
+		// If it's not in the static pool, we append it to expose it in the API
+		if !alreadyInResults {
+			results = append(results, upstreamStatus{
+				Address:     address,
+				NumRequests: int(count), // Cast uint from our map to int for the struct
+				Fails:       0,          // Ephemeral in-flight tracking doesn't track historic fails
+			})
 		}
-
-		results = append(results, upstreamStatus{
-			Address:     address,
-			NumRequests: upstream.NumRequests(),
-			Fails:       upstream.Fails(),
-		})
-		return true
-	})
+	}
 
 	// If an error happened during the range, return it
 	if rangeErr != nil {
